@@ -16,6 +16,9 @@
 #include "rd_error.h"
 #include "rd_xform.h"
 #include "vector.h"
+#include "ambient_light.h"
+#include "far_light.h"
+#include "point_light.h"
 
 using std::cerr;
 using std::clog;
@@ -27,8 +30,6 @@ using std::max;
 using std::ceil;
 using std::string;
 using std::stack;
-
-bool vertex_color = false;
 
 double** zBuffer = NULL;
 edge**   edgeTable = NULL;
@@ -46,8 +47,10 @@ vector cam_up(0, 1, 0);
 double cam_fov = 90;
 
 stack<rd_xform> rd_xform_stack;
+stack<rd_xform> rd_norm_stack;
 
 rd_xform current_xform;
+rd_xform normal_xform;
 rd_xform world_to_clip_xform;
 rd_xform clip_to_device_xform;
 
@@ -57,6 +60,24 @@ static int rd_direct_frameNumber;
 
 double PI = 3.14159265;
 int NUM_DIVISIONS = 20;
+
+// Lighting Global Variables
+ambient_light ambient;
+far_light     farLights[30];
+int           farCount = 0;
+point_light   pointLights[30];
+int           pointCount = 0;
+float         kA = 1, kD = 0, kS = 0;
+color         surface_color(1, 1, 1);
+color         specular_color(1, 1, 1);
+float         specular_exp = 10;
+bool          vertex_color = false;
+bool          vertex_normal = false;
+bool          vertex_texture = false;
+bool          vertex_interp = true;
+vector        view_vector;
+vector        poly_normal;
+attr_point    surface_point;
 
 // Flood Fill functions
 void find_span(int& x_start, int& x_end, int y, color& seed_color);
@@ -93,6 +114,12 @@ void updateAET(int scanline, edge* &aet);
 void resortAET(edge* &aet);
 void deleteAfter(edge* &e);
 
+// Lighting
+void matte_shader(color& c);
+void metal_shader(color& c);
+void plastic_shader(color& c);
+void (*surface_shader)(color&) = matte_shader;
+
 int REDirect::rd_display(const string& name, const string& type, const string& mode)
 {
   return RD_OK;
@@ -105,7 +132,14 @@ int REDirect::rd_format(int xresolution, int yresolution)
 
 int REDirect::rd_world_begin(void)
 {
+  ambient.r = 1;
+  ambient.g = 1;
+  ambient.b = 1;
+  farCount = 0;
+  pointCount = 0;
+
   current_xform = rd_xform::identity();
+  normal_xform = rd_xform::identity();
 
   rd_xform world2cam = rd_xform::world_to_camera(cam_eye, cam_at, cam_up);
   rd_xform cam2clip  = rd_xform::camera_to_clip(cam_fov, near_clip, far_clip, (double)display_xSize / (double)display_ySize);
@@ -128,7 +162,7 @@ int REDirect::rd_world_begin(void)
     edgeTable = new edge*[display_ySize];
     for(int i = 0; i < display_ySize; i++)
     {
-      edgeTable[i] = 0;
+      edgeTable[i] = NULL;
     }//end for
   }//end if
 
@@ -152,6 +186,7 @@ int REDirect::rd_world_end(void)
 int REDirect::rd_frame_begin(int frame_no)
 {
   rd_direct_frameNumber = frame_no;
+
   return RD_OK;
 }//end rd_frame_begin
 
@@ -232,6 +267,7 @@ int REDirect::rd_translate(const float offset[3])
 int REDirect::rd_scale(const float scale_factor[3])
 {
   current_xform = rd_xform::scale(current_xform, scale_factor[0], scale_factor[1], scale_factor[2]);
+  normal_xform = rd_xform::scale(normal_xform, 1 / scale_factor[0], 1 / scale_factor[1], 1 / scale_factor[2]);
 
   return RD_OK;
 }//end rd_scale
@@ -239,6 +275,7 @@ int REDirect::rd_scale(const float scale_factor[3])
 int REDirect::rd_rotate_xy(float angle)
 {
   current_xform = rd_xform::rotate_xy(current_xform, angle);
+  normal_xform = rd_xform::rotate_xy(normal_xform, angle);
 
   return RD_OK;
 }//end rd_rotate_xy
@@ -246,6 +283,7 @@ int REDirect::rd_rotate_xy(float angle)
 int REDirect::rd_rotate_yz(float angle)
 {
   current_xform = rd_xform::rotate_yz(current_xform, angle);
+  normal_xform = rd_xform::rotate_yz(normal_xform, angle);
 
   return RD_OK;
 }//end rd_rotate_yz
@@ -253,6 +291,7 @@ int REDirect::rd_rotate_yz(float angle)
 int REDirect::rd_rotate_zx(float angle)
 {
   current_xform = rd_xform::rotate_zx(current_xform, angle);
+  normal_xform = rd_xform::rotate_zx(normal_xform, angle);
 
   return RD_OK;
 }//end rd_rotate_zx
@@ -260,6 +299,7 @@ int REDirect::rd_rotate_zx(float angle)
 int REDirect::rd_xform_push(void)
 {
   rd_xform_stack.push(current_xform);
+  rd_norm_stack.push(normal_xform);
 
   return RD_OK;
 }//end rd_xform_push
@@ -268,12 +308,18 @@ int REDirect::rd_xform_pop(void)
 {
   current_xform = rd_xform_stack.top();
   rd_xform_stack.pop();
+  normal_xform = rd_norm_stack.top();
+  rd_norm_stack.pop();
 
   return RD_OK;
 }//end rd_xform_pop
 
 int REDirect::rd_cone(float height, float radius, float thetamax)
 {
+  vertex_color = false;
+  vertex_texture = false;
+  vertex_normal = true;
+
   for(int theta = 0; theta < NUM_DIVISIONS; theta++)
   {
     // Find theta in radians (based on step / num_divisions)
@@ -288,24 +334,41 @@ int REDirect::rd_cone(float height, float radius, float thetamax)
     one.coord[1] = radius * sin(thetaRadians);
     one.coord[2] = 0;
     one.coord[3] = 1;
+    one.coord[ATTR_NX] = one.coord[0];
+    one.coord[ATTR_NY] = one.coord[1];
+    one.coord[ATTR_NZ] = radius / height;
 
     attr_point two;
     two.coord[0] = radius * cos(thetaPlusOneRadians);
     two.coord[1] = radius * sin(thetaPlusOneRadians);
     two.coord[2] = 0;
     two.coord[3] = 1;
+    two.coord[ATTR_NX] = two.coord[0];
+    two.coord[ATTR_NY] = two.coord[1];
+    two.coord[ATTR_NZ] = radius / height;
 
     attr_point three;
     three.coord[0] = 0;
     three.coord[1] = 0;
     three.coord[2] = height;
     three.coord[3] = 1;
+    three.coord[ATTR_NX] = three.coord[0];
+    three.coord[ATTR_NY] = three.coord[1];
+    three.coord[ATTR_NZ] = radius / height;
 
     attr_point four;
     four.coord[0] = 0;
     four.coord[1] = 0;
     four.coord[2] = height;
     four.coord[3] = 1;
+    four.coord[ATTR_NX] = four.coord[0];
+    four.coord[ATTR_NY] = four.coord[1];
+    four.coord[ATTR_NZ] = radius / height;
+
+    vector edge1(two.coord[0] - one.coord[0], two.coord[1] - one.coord[1], two.coord[2] - one.coord[2]);
+    vector edge2(three.coord[0] - two.coord[0], three.coord[1] - two.coord[1], three.coord[2] - two.coord[2]);
+
+    poly_normal = vector::cross(edge1, edge2);
 
     // Draw the face
     poly_pipeline(one, MOVE);
@@ -319,6 +382,28 @@ int REDirect::rd_cone(float height, float radius, float thetamax)
 
 int REDirect::rd_cube(void)
 {
+  vertex_color = false;
+  vertex_texture = false;
+  vertex_normal = true;
+
+  int front[]  = {0, 1, 2, 3};
+  int right[]  = {1, 5, 6, 2};
+  int left[]   = {4, 0, 3, 7};
+  int back[]   = {4, 7, 6, 5};
+  int bottom[] = {0, 4, 5, 1};
+  int top[]    = {3, 2, 6, 7};
+
+  int* faces[] = {front, right, left, back, bottom, top};
+
+  int frontNormal[]  = {0, -1, 0};
+  int rightNormal[]  = {1, 0, 0};
+  int leftNormal[]   = {-1, 0, 0};
+  int backNormal[]   = {0, 1, 0};
+  int bottomNormal[] = {0, 0, -1};
+  int topNormal[]    = {0, 0, 1};
+
+  int* normals[] = {frontNormal, rightNormal, leftNormal, backNormal, bottomNormal, topNormal};
+
   attr_point vertices[8];
 
   vertices[0].coord[0] = -1;
@@ -361,41 +446,45 @@ int REDirect::rd_cube(void)
   vertices[7].coord[2] =  1;
   vertices[7].coord[3] =  1;
 
-  poly_pipeline(vertices[0], MOVE);
-  poly_pipeline(vertices[1], MOVE);
-  poly_pipeline(vertices[2], MOVE);
-  poly_pipeline(vertices[3], DRAW);
+  // Set each vertex normal (dependent on face) and
+  // send the vertices into the pipeline
+  for(int i = 0; i < 6; i++)
+  {
+    for(int j = 0; j < 4; j++)
+    {
+      vertices[(faces[i])[j]].coord[ATTR_NX] = (normals[i])[0];
+      vertices[(faces[i])[j]].coord[ATTR_NY] = (normals[i])[1];
+      vertices[(faces[i])[j]].coord[ATTR_NZ] = (normals[i])[2];
 
-  poly_pipeline(vertices[1], MOVE);
-  poly_pipeline(vertices[5], MOVE);
-  poly_pipeline(vertices[6], MOVE);
-  poly_pipeline(vertices[2], DRAW);
+      if(j != 3)
+      {
+	poly_pipeline(vertices[(faces[i])[j]], MOVE);
+      }//end if
+      else
+      {
+	vector edge1(vertices[(faces[i])[1]].coord[0] - vertices[(faces[i])[0]].coord[0],
+		     vertices[(faces[i])[1]].coord[1] - vertices[(faces[i])[0]].coord[1],
+		     vertices[(faces[i])[1]].coord[2] - vertices[(faces[i])[0]].coord[2]);
+	vector edge2(vertices[(faces[i])[2]].coord[0] - vertices[(faces[i])[1]].coord[0],
+		     vertices[(faces[i])[2]].coord[1] - vertices[(faces[i])[1]].coord[1],
+		     vertices[(faces[i])[2]].coord[2] - vertices[(faces[i])[1]].coord[2]);
 
-  poly_pipeline(vertices[4], MOVE);
-  poly_pipeline(vertices[0], MOVE);
-  poly_pipeline(vertices[3], MOVE);
-  poly_pipeline(vertices[7], DRAW);
+	poly_normal = vector::cross(edge1, edge2);
 
-  poly_pipeline(vertices[4], MOVE);
-  poly_pipeline(vertices[7], MOVE);
-  poly_pipeline(vertices[6], MOVE);
-  poly_pipeline(vertices[5], DRAW);
-
-  poly_pipeline(vertices[0], MOVE);
-  poly_pipeline(vertices[4], MOVE);
-  poly_pipeline(vertices[5], MOVE);
-  poly_pipeline(vertices[1], DRAW);
-
-  poly_pipeline(vertices[3], MOVE);
-  poly_pipeline(vertices[2], MOVE);
-  poly_pipeline(vertices[6], MOVE);
-  poly_pipeline(vertices[7], DRAW);
+	poly_pipeline(vertices[(faces[i])[j]], DRAW);
+      }//end else
+    }//end for
+  }//end for
 
   return RD_OK;
 }//end rd_cube
 
 int REDirect::rd_cylinder(float radius, float zmin, float zmax, float thetamax)
 {
+  vertex_color = false;
+  vertex_texture = false;
+  vertex_normal = true;
+
   for(int theta = 0; theta < NUM_DIVISIONS; theta++)
   {
     // Find theta in radians (based on step / num_divisions)
@@ -415,24 +504,41 @@ int REDirect::rd_cylinder(float radius, float zmin, float zmax, float thetamax)
     one.coord[1] = y;
     one.coord[2] = zmin;
     one.coord[3] = 1;
+    one.coord[ATTR_NX] = one.coord[0];
+    one.coord[ATTR_NY] = one.coord[1];
+    one.coord[ATTR_NZ] = 0;
 
     attr_point two;
     two.coord[0] = xPlusOne;
     two.coord[1] = yPlusOne;
     two.coord[2] = zmin;
     two.coord[3] = 1;
+    two.coord[ATTR_NX] = two.coord[0];
+    two.coord[ATTR_NY] = two.coord[1];
+    two.coord[ATTR_NZ] = 0;
 
     attr_point three;
     three.coord[0] = xPlusOne;
     three.coord[1] = yPlusOne;
     three.coord[2] = zmax;
     three.coord[3] = 1;
+    three.coord[ATTR_NX] = three.coord[0];
+    three.coord[ATTR_NY] = three.coord[1];
+    three.coord[ATTR_NZ] = 0;
 
     attr_point four;
     four.coord[0] = x;
     four.coord[1] = y;
     four.coord[2] = zmax;
     four.coord[3] = 1;
+    four.coord[ATTR_NX] = four.coord[0];
+    four.coord[ATTR_NY] = four.coord[1];
+    four.coord[ATTR_NZ] = 0;
+
+    vector edge1(two.coord[0] - one.coord[0], two.coord[1] - one.coord[1], two.coord[2] - one.coord[2]);
+    vector edge2(three.coord[0] - two.coord[0], three.coord[1] - two.coord[1], three.coord[2] - two.coord[2]);
+
+    poly_normal = vector::cross(edge1, edge2);
 
     // Draw the face
     poly_pipeline(one, MOVE);
@@ -446,6 +552,10 @@ int REDirect::rd_cylinder(float radius, float zmin, float zmax, float thetamax)
 
 int REDirect::rd_disk(float height, float radius, float thetamax)
 {
+  vertex_color = false;
+  vertex_texture = false;
+  vertex_normal = true;
+
   for(int theta = 0; theta < NUM_DIVISIONS; theta++)
   {
     // Find theta in radians (based on step / num_divisions)
@@ -465,24 +575,38 @@ int REDirect::rd_disk(float height, float radius, float thetamax)
     one.coord[1] = y;
     one.coord[2] = height;
     one.coord[3] = 1;
+    one.coord[ATTR_NX] = 0;
+    one.coord[ATTR_NY] = 0;
+    one.coord[ATTR_NZ] = 1;
 
     attr_point two;
     two.coord[0] = xPlusOne;
     two.coord[1] = yPlusOne;
     two.coord[2] = height;
     two.coord[3] = 1;
+    two.coord[ATTR_NX] = 0;
+    two.coord[ATTR_NY] = 0;
+    two.coord[ATTR_NZ] = 1;
 
     attr_point three;
     three.coord[0] = 0;
     three.coord[1] = 0;
     three.coord[2] = height;
     three.coord[3] = 1;
+    three.coord[ATTR_NX] = 0;
+    three.coord[ATTR_NY] = 0;
+    three.coord[ATTR_NZ] = 1;
 
     attr_point four;
     four.coord[0] = 0;
     four.coord[1] = 0;
     four.coord[2] = height;
     four.coord[3] = 1;
+    four.coord[ATTR_NX] = 0;
+    four.coord[ATTR_NY] = 0;
+    four.coord[ATTR_NZ] = 1;
+
+    poly_normal = vector(0, 0, 1);
 
     // Draw the face
     poly_pipeline(one, MOVE);
@@ -496,6 +620,10 @@ int REDirect::rd_disk(float height, float radius, float thetamax)
 
 int REDirect::rd_sphere(float radius, float zmin, float zmax, float thetamax)
 {
+  vertex_color = false;
+  vertex_texture = false;
+  vertex_normal = true;
+
   for(int phi = 0; phi < NUM_DIVISIONS / 2; phi++)
   {
     // Find phi in radians
@@ -521,24 +649,41 @@ int REDirect::rd_sphere(float radius, float zmin, float zmax, float thetamax)
       one.coord[1] = radiusPrime * sin(thetaRadians);
       one.coord[2] = radius * sin(phiRadians);
       one.coord[3] = 1;
+      one.coord[ATTR_NX] = one.coord[0];
+      one.coord[ATTR_NY] = one.coord[1];
+      one.coord[ATTR_NZ] = one.coord[2];
 
       attr_point two;
       two.coord[0] = radiusPrime * cos(thetaPlusOneRadians);
       two.coord[1] = radiusPrime * sin(thetaPlusOneRadians);
       two.coord[2] = radius * sin(phiRadians);
       two.coord[3] = 1;
+      two.coord[ATTR_NX] = two.coord[0];
+      two.coord[ATTR_NY] = two.coord[1];
+      two.coord[ATTR_NZ] = two.coord[2];
 
       attr_point three;
       three.coord[0] = radiusPrimePlusOne * cos(thetaPlusOneRadians);
       three.coord[1] = radiusPrimePlusOne * sin(thetaPlusOneRadians);
       three.coord[2] = radius * sin(phiPlusOneRadians);
       three.coord[3] = 1;
+      three.coord[ATTR_NX] = three.coord[0];
+      three.coord[ATTR_NY] = three.coord[1];
+      three.coord[ATTR_NZ] = three.coord[2];
 
       attr_point four;
       four.coord[0] = radiusPrimePlusOne * cos(thetaRadians);
       four.coord[1] = radiusPrimePlusOne * sin(thetaRadians);
       four.coord[2] = radius * sin(phiPlusOneRadians);
       four.coord[3] = 1;
+      four.coord[ATTR_NX] = four.coord[0];
+      four.coord[ATTR_NY] = four.coord[1];
+      four.coord[ATTR_NZ] = four.coord[2];
+
+      vector edge1(two.coord[0] - one.coord[0], two.coord[1] - one.coord[1], two.coord[2] - one.coord[2]);
+      vector edge2(three.coord[0] - two.coord[0], three.coord[1] - two.coord[1], three.coord[2] - two.coord[2]);
+
+      poly_normal = vector::cross(edge1, edge2);
 
       // Draw the face
       poly_pipeline(one, MOVE);
@@ -561,8 +706,107 @@ int REDirect::rd_background(const float color[])
 int REDirect::rd_color(const float color[])
 {
   rd_direct_color.setColor(color[0], color[1], color[2]);
+  surface_color.setColor(color[0], color[1], color[2]);
   return RD_OK;
 }//end rd_color
+
+int REDirect::rd_surface(const string& shader_type)
+{
+  if(shader_type.compare("Matte") == 0 || shader_type.compare("matte") == 0)
+  {
+    surface_shader = &matte_shader;
+  }//end if
+  else if(shader_type.compare("Metal") == 0 || shader_type.compare("metal") == 0)
+  {
+    surface_shader = &metal_shader;
+  }//end else if
+  else if(shader_type.compare("Plastic") == 0 || shader_type.compare("plastic") == 0)
+  {
+    surface_shader = &plastic_shader;
+  }//end else if
+  else
+  {
+    cerr << "ERROR: Invalid surface shader \"" << shader_type << "\"" << endl;
+    return RD_INPUT_UNKNOWN_SURFACE_TYPE;
+  }//end else
+  return RD_OK;
+}//end rd_surface
+
+int REDirect::rd_point_light(const float pos[3], const float color[], float intensity)
+{
+  pointLights[pointCount].r = color[0] * intensity;
+  pointLights[pointCount].g = color[1] * intensity;
+  pointLights[pointCount].b = color[2] * intensity;
+
+  pointLights[pointCount].x = pos[0];
+  pointLights[pointCount].y = pos[1];
+  pointLights[pointCount].z = pos[2];
+
+  pointCount++;
+
+  return RD_OK;
+}//end rd_point_light
+
+int REDirect::rd_far_light(const float dir[3], const float color[], float intensity)
+{
+  farLights[farCount].r = color[0] * intensity;
+  farLights[farCount].g = color[1] * intensity;
+  farLights[farCount].b = color[2] * intensity;
+
+  farLights[farCount].xDir = dir[0];
+  farLights[farCount].yDir = dir[1];
+  farLights[farCount].zDir = dir[2];
+
+  farCount++;
+
+  return RD_OK;
+}//end rd_far_light
+
+int REDirect::rd_ambient_light(const float color[], float intensity)
+{
+  ambient.r = color[0] * intensity;
+  ambient.g = color[1] * intensity;
+  ambient.b = color[2] * intensity;
+
+  return RD_OK;
+}//end rd_ambient_light
+
+int REDirect::rd_specular_color(const float color[], int exponent)
+{
+  specular_color.setColor(color[0], color[1], color[2]);
+  specular_exp = exponent;
+
+  return RD_OK;
+}//end rd_specular_color
+
+int REDirect::rd_k_ambient(float Ka)
+{
+  kA = Ka;
+
+  return RD_OK;
+}//end rd_k_ambient
+
+int REDirect::rd_k_diffuse(float Kd)
+{
+  kD = Kd;
+
+  return RD_OK;
+}//end rd_k_diffuse
+
+int REDirect::rd_k_specular(float Ks)
+{
+  kS = Ks;
+
+  return RD_OK;
+}//end rd_k_specular
+
+int REDirect::rd_option_bool(const string& name, bool flag)
+{
+  if(name.compare("Interpolate") == 0)
+    vertex_interp = flag;
+
+  return RD_OK;
+}//end rd_option_bool
 
 int REDirect::rd_circle(const float center[3], float radius)
 {
@@ -625,6 +869,10 @@ int REDirect::rd_pointset(const string & vertex_type, int nvertex, const float *
 
 int REDirect::rd_polyset(const string & vertex_type, int nvertex, const float * vertex, int nface, const int * face)
 {
+  vertex_color = (vertex_type.find("C") != string::npos);
+  vertex_texture = (vertex_type.find("T") != string::npos);
+  vertex_normal = (vertex_type.find("N") != string::npos);
+
   int numValues = get_vertex_size(vertex_type);
   bool flag = MOVE;
 
@@ -638,10 +886,38 @@ int REDirect::rd_polyset(const string & vertex_type, int nvertex, const float * 
       temp.coord[1] = vertex[(face[i] * numValues) + 1];
       temp.coord[2] = vertex[(face[i] * numValues) + 2];
       temp.coord[3] = 1;
+
+      if(vertex_color)
+      {
+	temp.coord[ATTR_R] = vertex[(face[i] * numValues) + ATTR_R];
+	temp.coord[ATTR_G] = vertex[(face[i] * numValues) + ATTR_G];
+	temp.coord[ATTR_B] = vertex[(face[i] * numValues) + ATTR_B];
+      }//end if
+
+      if(vertex_normal)
+      {
+        temp.coord[ATTR_NX] = vertex[(face[i] * numValues) + ATTR_NX];
+        temp.coord[ATTR_NY] = vertex[(face[i] * numValues) + ATTR_NY];
+        temp.coord[ATTR_NZ] = vertex[(face[i] * numValues) + ATTR_NZ];
+      }//end if
+
       if(face[i + 1] != -1)
         flag = MOVE;
       else
         flag = DRAW;
+
+      if(flag == DRAW)
+      {
+	vector edge1(vertex[(face[i-1] * numValues)] - vertex[(face[i-2] * numValues)],
+		     vertex[(face[i-1] * numValues) + 1] - vertex[(face[i-2] * numValues) + 1],
+		     vertex[(face[i-1] * numValues) + 2] - vertex[(face[i-2] * numValues) + 2]);
+	vector edge2(vertex[(face[i] * numValues)] - vertex[(face[i-1] * numValues)],
+		     vertex[(face[i] * numValues) + 1] - vertex[(face[i-1] * numValues) + 1],
+		     vertex[(face[i] * numValues) + 2] - vertex[(face[i-1] * numValues) + 2]);
+
+	poly_normal = vector::cross(edge1, edge2);
+      }//end if
+
       poly_pipeline(temp, flag);
     }//end if
     else
@@ -804,13 +1080,8 @@ void line_pipeline(const pointh& p, bool draw_flag)
 void poly_pipeline(attr_point& p, bool draw_flag)
 {
   pointh geom, norm;
-  attr_point ap;
-
   // Copy the input vertex
-  for(int i = 0; i < ATTR_SIZE; i++)
-  {
-    ap.coord[i] = p.coord[i];
-  }//end for
+  attr_point ap = p;
 
   const int MAX_VERTEX_LIST_SIZE = 50;
   static attr_point vertex_list[MAX_VERTEX_LIST_SIZE];
@@ -825,12 +1096,30 @@ void poly_pipeline(attr_point& p, bool draw_flag)
 
   // Transform by current transform and transform to clip coords
   geom = rd_xform::multiply(current_xform, geom);
+  ap.coord[ATTR_WORLD_X] = geom.x;
+  ap.coord[ATTR_WORLD_Y] = geom.y;
+  ap.coord[ATTR_WORLD_Z] = geom.z;
   geom = rd_xform::multiply(world_to_clip_xform, geom);
-
   ap.coord[0] = geom.x;
   ap.coord[1] = geom.y;
   ap.coord[2] = geom.z;
   ap.coord[3] = geom.w;
+
+  if(vertex_normal)
+  {
+    // Transform vertex normal to world coordinates
+    norm.x = ap.coord[ATTR_NX];
+    norm.y = ap.coord[ATTR_NY];
+    norm.z = ap.coord[ATTR_NZ];
+    norm.w = 0;
+    norm = rd_xform::multiply(normal_xform, norm);
+    ap.coord[ATTR_NX] = norm.x;
+    ap.coord[ATTR_NY] = norm.y;
+    ap.coord[ATTR_NZ] = norm.z;
+  }//end if
+
+  // Set attr_point constant
+  ap.coord[ATTR_CONSTANT] = 1.0;
 
   // Store in vertex list
   if(n_vertex == MAX_VERTEX_LIST_SIZE)
@@ -862,16 +1151,27 @@ void poly_pipeline(attr_point& p, bool draw_flag)
 
       dev = rd_xform::multiply(clip_to_device_xform, dev);
 
-      clipped_list[i].coord[0] = dev.x - 0.5;
-      clipped_list[i].coord[1] = dev.y - 0.5;
+      clipped_list[i].coord[0] = dev.x;
+      clipped_list[i].coord[1] = dev.y;
       clipped_list[i].coord[2] = dev.z;
       clipped_list[i].coord[3] = dev.w;
 
       // Divide geometry by W
-      clipped_list[i].coord[0] /= clipped_list[i].coord[3];
-      clipped_list[i].coord[1] /= clipped_list[i].coord[3];
-      clipped_list[i].coord[2] /= clipped_list[i].coord[3];
+      for(int j = 0; j < ATTR_SIZE; j++)
+      {
+	clipped_list[i].coord[j] /= clipped_list[i].coord[3];
+      }//end for
     }//end for
+
+    // Transform poly_normal from object to world coords
+    norm.x = poly_normal.x;
+    norm.y = poly_normal.y;
+    norm.z = poly_normal.z;
+    norm.w = 1;
+    norm = rd_xform::multiply(normal_xform, norm);
+    poly_normal.x = norm.x;
+    poly_normal.y = norm.y;
+    poly_normal.z = norm.z;
 
     scan_convert(clipped_list, n_clipped);
   }//end if
@@ -1029,11 +1329,7 @@ int poly_clip(int n_vertex, attr_point* vertex_list, attr_point* clipped_list)
 void clip_point(attr_point& p, int bound, attr_point* first, attr_point* last, bool* stage_seen, int n_vertex, attr_point* vertex_list, int& n_clipped, attr_point* clipped_list)
 {
   // Copy input attr_point
-  attr_point ap;
-  for(int i = 0; i < ATTR_SIZE; i++)
-  {
-    ap.coord[i] = p.coord[i];
-  }//end for
+  attr_point ap = p;
 
   // If this is the first time a point has been
   // seen at this stage
@@ -1190,29 +1486,13 @@ attr_point intersect(attr_point& p, attr_point& last, int bound)
   }//end switch
 
   // Find alpha to interpolate to
-  double alphaMin = 0;
-  double alphaMax = 1;
   double alpha = boundary_coord1 / (boundary_coord1 - boundary_coord2);
-
-  if(boundary_coord1 < 0.0)
-    alphaMin = max(alphaMin, alpha);
-  if(boundary_coord2 < 0.0)
-    alphaMax = min(alphaMax, alpha);
-
   attr_point out;
 
-  if(alphaMin < alphaMax)
+  for(int i = 0; i < ATTR_SIZE; i++)
   {
-    if(alphaMin != 0)
-      alpha = alphaMin;
-    if(alphaMax != 1)
-      alpha = alphaMax;
-
-    for(int i = 0; i < ATTR_SIZE; i++)
-    {
-      out.coord[i] = p.coord[i] + alpha * (last.coord[i] - p.coord[i]);
-    }//end for
-  }//end if
+    out.coord[i] = p.coord[i] + alpha * (last.coord[i] - p.coord[i]);
+  }//end for
 
   return out;
 }//end intersect
@@ -1224,14 +1504,10 @@ bool cross(attr_point& p1, attr_point& p2, int bound)
 
 void display_pixel(int x, int y, double z, float color[3])
 {
-  if(x >= 0 && x < display_xSize &&
-     y >= 0 && y < display_ySize)
+  if(z < zBuffer[x][y])
   {
-    if(z < zBuffer[x][y])
-    {
-      rd_write_pixel(x, y, color);
-      zBuffer[x][y] = z;
-    }//end if
+    rd_write_pixel(x, y, color);
+    zBuffer[x][y] = z;
   }//end if
 }//end display_pixel
 
@@ -1256,12 +1532,9 @@ void scan_convert(attr_point* clipped_list, int n_vertex)
     // and keep the AET sorted by X coordinates
     addActiveList(scanline, aet);
 
-    if(aet != NULL)
-    {
-      edgeFill(scanline, aet);
-      updateAET(scanline, aet);
-      resortAET(aet);
-    }//end if
+    edgeFill(scanline, aet);
+    updateAET(scanline, aet);
+    resortAET(aet);
   }//end for
 }//end scan_convert
 
@@ -1432,25 +1705,39 @@ void edgeFill(int scanline, edge* &aet)
 
       int endx = ceil(p2->p.coord[0]);
 
-      while(value.coord[0] <= endx)
+      while(value.coord[0] < endx)
       {
-	// Retreive color from current value
-	float color[] = {value.coord[ATTR_R], value.coord[ATTR_G], value.coord[ATTR_B]};
+	for(int i = ATTR_CONSTANT; i < ATTR_SIZE; i++)
+	{
+	  surface_point.coord[i] = value.coord[i] / value.coord[ATTR_CONSTANT];
+	}//end for
 
+	// Retreive color from current value
 	if(vertex_color)
 	{
-	  display_pixel(value.coord[0], scanline, value.coord[2], color);
+  	  color vertex_color(value.coord[ATTR_R], value.coord[ATTR_G], value.coord[ATTR_B]);
+	  surface_shader(vertex_color);
+	  display_pixel(value.coord[0], scanline, value.coord[2], vertex_color.getRGB());
 	}//end if
 	else
 	{
-	  display_pixel(value.coord[0], scanline, value.coord[2], rd_direct_color.getRGB());
+	  color object_color(surface_color.red, surface_color.green, surface_color.blue);
+	  surface_shader(object_color);
+	  display_pixel(value.coord[0], scanline, value.coord[2], object_color.getRGB());
 	}//end else
 
 	// Increment the values
-	for(int i = 0; i < ATTR_SIZE; i++)
+	for(int i = 0; i < 4; i++)
 	{
 	  value.coord[i] += inc.coord[i];
 	}//end for
+	if(vertex_interp)
+	{
+	  for(int i = ATTR_CONSTANT; i < ATTR_SIZE; i++)
+	  {
+	    value.coord[i] += inc.coord[i];
+	  }//end for
+	}//end if
       }//end while
     }//end if
 
@@ -1527,3 +1814,308 @@ void deleteAfter(edge* &e)
   e->next = p->next;
   delete p;
 }//end deleteAfter
+
+void matte_shader(color& c)
+{
+  double NdotL;
+  double rSum = 0;
+  double gSum = 0;
+  double bSum = 0;
+
+  vector N;
+
+  if(vertex_interp && vertex_normal)
+    N = vector(surface_point.coord[ATTR_NX], surface_point.coord[ATTR_NY], surface_point.coord[ATTR_NZ]);
+  else
+    N = vector(poly_normal.x, poly_normal.y, poly_normal.z);
+  vector::normalize(N);
+
+  for(int i = 0; i < farCount; i++)
+  {
+    vector L(farLights[i].xDir * -1, farLights[i].yDir * -1, farLights[i].zDir * -1);
+    vector::normalize(L);
+    NdotL = vector::dot(N, L);
+    if(NdotL < 0)
+      NdotL = 0;
+    rSum += (NdotL * farLights[i].r);
+    gSum += (NdotL * farLights[i].g);
+    bSum += (NdotL * farLights[i].b);
+  }//end for
+
+  for(int i = 0; i < pointCount; i++)
+  {
+    double radiusSq = pow(pointLights[i].x - surface_point.coord[ATTR_WORLD_X], 2) +
+                      pow(pointLights[i].y - surface_point.coord[ATTR_WORLD_Y], 2) +
+		      pow(pointLights[i].z - surface_point.coord[ATTR_WORLD_Z], 2);
+
+    double falloff = 1 / radiusSq;
+
+    vector L(pointLights[i].x - surface_point.coord[ATTR_WORLD_X],
+	     pointLights[i].y - surface_point.coord[ATTR_WORLD_Y],
+	     pointLights[i].z - surface_point.coord[ATTR_WORLD_Z]);
+
+    vector::normalize(L);
+
+    NdotL = vector::dot(N, L);
+    if(NdotL < 0)
+      NdotL = 0;
+
+    rSum += (NdotL * (pointLights[i].r * falloff));
+    gSum += (NdotL * (pointLights[i].g * falloff));
+    bSum += (NdotL * (pointLights[i].b * falloff));
+  }//end for
+
+  c.red = kA * c.red * ambient.r + kD * c.red * rSum;
+  c.green = kA * c.green * ambient.g + kD * c.green * gSum;
+  c.blue = kA * c.blue * ambient.b + kD * c.blue * bSum;
+
+  if(c.red > 1)
+    c.red = 1;
+  else if(c.red < 0)
+    c.red = 0;
+
+  if(c.green > 1)
+    c.green = 1;
+  else if(c.green < 0)
+    c.green = 0;
+
+  if(c.blue > 1)
+    c.blue = 1;
+  else if(c.blue < 0)
+    c.blue = 0;
+
+}//end matte_shader
+
+void metal_shader(color& c)
+{
+  double NdotL;
+  double VdotR;
+  double rSum_spec = 0;
+  double gSum_spec = 0;
+  double bSum_spec = 0;
+
+  vector N;
+  vector V(cam_eye.x - surface_point.coord[ATTR_WORLD_X],
+	   cam_eye.y - surface_point.coord[ATTR_WORLD_Y],
+	   cam_eye.z - surface_point.coord[ATTR_WORLD_Z]);
+  vector::normalize(V);
+
+  if(vertex_interp && vertex_normal)
+    N = vector(surface_point.coord[ATTR_NX], surface_point.coord[ATTR_NY], surface_point.coord[ATTR_NZ]);
+  else
+    N = vector(poly_normal.x, poly_normal.y, poly_normal.z);
+  vector::normalize(N);
+
+  bool calcLight = (vector::dot(V, N) >= 0);
+
+  if(calcLight)
+  {
+
+    // Far Lights
+    for(int i = 0; i < farCount; i++)
+    {
+      vector L(farLights[i].xDir * -1, farLights[i].yDir * -1, farLights[i].zDir * -1);
+      vector::normalize(L);
+      NdotL = vector::dot(N, L);
+      if(NdotL < 0)
+        NdotL = 0;
+    
+      vector R;
+      R.x = ((2 * NdotL) / vector::mag2(N)) * N.x - L.x;
+      R.y = ((2 * NdotL) / vector::mag2(N)) * N.y - L.y;
+      R.z = ((2 * NdotL) / vector::mag2(N)) * N.z - L.z;
+
+      vector::normalize(R);
+      VdotR = vector::dot(V, R);
+      if(VdotR < 0)
+        VdotR = 0;
+
+      if(NdotL > 0 && VdotR > 0)
+      {
+        rSum_spec += (pow(VdotR, specular_exp) * farLights[i].r);
+        gSum_spec += (pow(VdotR, specular_exp) * farLights[i].g);
+        bSum_spec += (pow(VdotR, specular_exp) * farLights[i].b);
+      }//end if
+    }//end for
+
+    // Point Lights
+    for(int i = 0; i < pointCount; i++)
+    {
+      double radiusSq = pow(pointLights[i].x - surface_point.coord[ATTR_WORLD_X], 2) +
+                        pow(pointLights[i].y - surface_point.coord[ATTR_WORLD_Y], 2) +
+		        pow(pointLights[i].z - surface_point.coord[ATTR_WORLD_Z], 2);
+
+      double falloff = 1 / radiusSq;
+
+      vector L(pointLights[i].x - surface_point.coord[ATTR_WORLD_X],
+	       pointLights[i].y - surface_point.coord[ATTR_WORLD_Y],
+	       pointLights[i].z - surface_point.coord[ATTR_WORLD_Z]);
+      vector::normalize(L);
+      NdotL = vector::dot(N, L);
+      if(NdotL < 0)
+        NdotL = 0;
+
+      vector R;
+      R.x = ((2 * NdotL) / vector::mag2(N)) * N.x - L.x;
+      R.y = ((2 * NdotL) / vector::mag2(N)) * N.y - L.y;
+      R.z = ((2 * NdotL) / vector::mag2(N)) * N.z - L.z;
+
+      vector::normalize(R);
+      VdotR = vector::dot(V, R);
+      if(VdotR < 0)
+        VdotR = 0;
+
+      if(NdotL > 0 && VdotR > 0)
+      {
+        rSum_spec += (pow(VdotR, specular_exp) * (pointLights[i].r * falloff));
+        gSum_spec += (pow(VdotR, specular_exp) * (pointLights[i].g * falloff));
+        bSum_spec += (pow(VdotR, specular_exp) * (pointLights[i].b * falloff));
+      }//end if
+    }//end for
+  }//end if
+
+  c.red = kA * c.red * ambient.r + kS * surface_color.red * rSum_spec;
+  c.green = kA * c.green * ambient.g + kS * surface_color.green * gSum_spec;
+  c.blue = kA * c.blue * ambient.b + kS * surface_color.blue * bSum_spec;
+
+  if(c.red > 1)
+    c.red = 1;
+  else if(c.red < 0)
+    c.red = 0;
+
+  if(c.green > 1)
+    c.green = 1;
+  else if(c.green < 0)
+    c.green = 0;
+
+  if(c.blue > 1)
+    c.blue = 1;
+  else if(c.blue < 0)
+    c.blue = 0;
+
+}//end metal_shader
+
+void plastic_shader(color& c)
+{
+  double NdotL;
+  double VdotR;
+  double rSum_diff = 0;
+  double gSum_diff = 0;
+  double bSum_diff = 0;
+  double rSum_spec = 0;
+  double gSum_spec = 0;
+  double bSum_spec = 0;
+
+  vector N;
+  vector V(cam_eye.x - surface_point.coord[ATTR_WORLD_X],
+	   cam_eye.y - surface_point.coord[ATTR_WORLD_Y],
+	   cam_eye.z - surface_point.coord[ATTR_WORLD_Z]);
+  vector::normalize(V);
+
+  if(vertex_interp && vertex_normal)
+    N = vector(surface_point.coord[ATTR_NX], surface_point.coord[ATTR_NY], surface_point.coord[ATTR_NZ]);
+  else
+    N = vector(poly_normal.x, poly_normal.y, poly_normal.z);
+  vector::normalize(N);
+
+  bool calcLight = (vector::dot(V, N) >= 0);
+
+  if(calcLight)
+  {
+    // Far Lights
+    for(int i = 0; i < farCount; i++)
+    {
+      vector L(farLights[i].xDir * -1, farLights[i].yDir * -1, farLights[i].zDir * -1);
+      vector::normalize(L);
+      NdotL = vector::dot(N, L);
+      if(NdotL < 0)
+        NdotL = 0;
+    
+      if(NdotL > 0)
+      {
+        rSum_diff += (NdotL * farLights[i].r);
+        gSum_diff += (NdotL * farLights[i].g);
+        bSum_diff += (NdotL * farLights[i].b);
+      }//end if
+
+      vector R;
+      R.x = ((2 * NdotL) / vector::mag2(N)) * N.x - L.x;
+      R.y = ((2 * NdotL) / vector::mag2(N)) * N.y - L.y;
+      R.z = ((2 * NdotL) / vector::mag2(N)) * N.z - L.z;
+
+      vector::normalize(R);
+      VdotR = vector::dot(V, R);
+      if(VdotR < 0)
+        VdotR = 0;
+
+      if(NdotL > 0 && VdotR > 0)
+      {
+        rSum_spec += (pow(VdotR, specular_exp) * farLights[i].r);
+        gSum_spec += (pow(VdotR, specular_exp) * farLights[i].g);
+        bSum_spec += (pow(VdotR, specular_exp) * farLights[i].b);
+      }//end if
+    }//end for
+
+    // Point Lights
+    for(int i = 0; i < pointCount; i++)
+    {
+      double radiusSq = pow(pointLights[i].x - surface_point.coord[ATTR_WORLD_X], 2) +
+                        pow(pointLights[i].y - surface_point.coord[ATTR_WORLD_Y], 2) +
+		        pow(pointLights[i].z - surface_point.coord[ATTR_WORLD_Z], 2);
+
+      double falloff = 1 / radiusSq;
+
+      vector L(pointLights[i].x - surface_point.coord[ATTR_WORLD_X],
+	       pointLights[i].y - surface_point.coord[ATTR_WORLD_Y],
+	       pointLights[i].z - surface_point.coord[ATTR_WORLD_Z]);
+      vector::normalize(L);
+      NdotL = vector::dot(N, L);
+      if(NdotL < 0)
+        NdotL = 0;
+
+      if(NdotL > 0)
+      {
+        rSum_diff += (NdotL * (pointLights[i].r * falloff));
+        gSum_diff += (NdotL * (pointLights[i].g * falloff));
+        bSum_diff += (NdotL * (pointLights[i].b * falloff));
+      }//end if
+
+      vector R;
+      R.x = ((2 * NdotL) / vector::mag2(N)) * N.x - L.x;
+      R.y = ((2 * NdotL) / vector::mag2(N)) * N.y - L.y;
+      R.z = ((2 * NdotL) / vector::mag2(N)) * N.z - L.z;
+
+      vector::normalize(R);
+      VdotR = vector::dot(V, R);
+      if(VdotR < 0)
+        VdotR = 0;
+
+      if(NdotL > 0 && VdotR > 0)
+      {
+        rSum_spec += (pow(VdotR, specular_exp) * (pointLights[i].r * falloff));
+        gSum_spec += (pow(VdotR, specular_exp) * (pointLights[i].g * falloff));
+        bSum_spec += (pow(VdotR, specular_exp) * (pointLights[i].b * falloff));
+      }
+    }//end for
+  }//end if
+
+  c.red = kA * c.red * ambient.r + kD * c.red * rSum_diff + kS * specular_color.red * rSum_spec;
+  c.green = kA * c.green * ambient.g + kD * c.green * gSum_diff + kS * specular_color.green * gSum_spec;
+  c.blue = kA * c.blue * ambient.b + kD * c.blue * bSum_diff + kS * specular_color.blue * bSum_spec;
+
+  if(c.red > 1)
+    c.red = 1;
+  else if(c.red < 0)
+    c.red = 0;
+
+  if(c.green > 1)
+    c.green = 1;
+  else if(c.green < 0)
+    c.green = 0;
+
+  if(c.blue > 1)
+    c.blue = 1;
+  else if(c.blue < 0)
+    c.blue = 0;
+
+}//end plastic_shader

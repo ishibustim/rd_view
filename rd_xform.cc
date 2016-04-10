@@ -209,7 +209,8 @@ rd_xform rd_xform::clip_to_device(int width, int height)
   rd_xform toDevice = rd_xform::identity();
   toDevice.matrix[0][0] = width - epsilon;
   toDevice.matrix[1][1] = -1 * (height - epsilon);
-  toDevice.matrix[3][1] = height - epsilon;
+  toDevice.matrix[3][0] = -0.5;
+  toDevice.matrix[3][1] = height - epsilon - 0.5;
 
   return toDevice;
 }//end clip_to_device

@@ -44,6 +44,16 @@ class REDirect: public RenderEngine
 
   int rd_background(const float color[]);
   int rd_color(const float color[]);
+  int rd_surface(const string& shader_type);
+  int rd_point_light(const float pos[3], const float color[], float intensity);
+  int rd_far_light(const float dir[3], const float color[], float intensity);
+  int rd_ambient_light(const float color[], float intensity);
+  int rd_specular_color(const float color[], int exponent);
+  int rd_k_ambient(float Ka);
+  int rd_k_diffuse(float Kd);
+  int rd_k_specular(float Ks);
+
+  int rd_option_bool(const string& name, bool flag);
 
   int rd_circle(const float center[3], float radius);
   int rd_line(const float start[3], const float end[3]);
