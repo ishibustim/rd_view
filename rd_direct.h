@@ -19,6 +19,8 @@ class REDirect: public RenderEngine
   int rd_frame_begin(int frame_no);
   int rd_frame_end(void);
 
+  int rd_render_cleanup(void);
+
   int rd_camera_eye(const float eyepoint[3]);
   int rd_camera_at(const float atpoint[3]);
   int rd_camera_up(const float up[3]);

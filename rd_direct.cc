@@ -1,5 +1,7 @@
+// <iostream> included for debugging
 #include <iostream>
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <stack>
@@ -15,8 +17,13 @@
 using std::clog;
 using std::endl;
 
+using std::abs;
+using std::min;
+using std::max;
 using std::string;
 using std::stack;
+
+double** zBuffer = NULL;
 
 const bool MOVE = false;
 const bool DRAW = true;
@@ -51,6 +58,12 @@ void fff4(int x_start, int x_end, int y, color& seed_color, color& fill_color);
 void point_pipeline(const pointh& p);
 void line_pipeline(const pointh& p, bool draw_flag);
 
+// Clipping
+void line_clip(const pointh& p);
+
+// Pixel Drawing
+void display_pixel(int x, int y, double z, float color[3]);
+
 int REDirect::rd_display(const string& name, const string& type, const string& mode)
 {
   return RD_OK;
@@ -72,6 +85,23 @@ int REDirect::rd_world_begin(void)
   clip_to_device_xform = rd_xform::clip_to_device((double)display_xSize, (double)display_ySize);
   rd_disp_init_frame(rd_direct_frameNumber);
 
+  if(zBuffer == NULL)
+  {
+    zBuffer = new double*[display_xSize];
+    for(int i = 0; i < display_xSize; i++)
+    {
+      zBuffer[i] = new double[display_ySize];
+    }//end for
+  }//end if
+
+  for(int i = 0; i < display_xSize; i++)
+  {
+    for(int j = 0; j < display_ySize; j++)
+    {
+      zBuffer[i][j] = 1;
+    }//end for
+  }//end for
+
   return RD_OK;
 }//end rd_world_begin
 
@@ -92,6 +122,19 @@ int REDirect::rd_frame_end(void)
   rd_disp_end_frame();
   return RD_OK;
 }//end rd_frame_end
+
+int REDirect::rd_render_cleanup(void)
+{
+  for(int i = 0; i < display_xSize; i++)
+  {
+    delete zBuffer[i];
+  }//end for
+  delete zBuffer;
+
+  zBuffer = NULL;
+
+  return RD_OK;
+}//end rd_render_cleanup
 
 int REDirect::rd_camera_eye(const float eyepoint[3])
 {
@@ -338,15 +381,15 @@ int REDirect::rd_disk(float height, float radius, float thetamax)
 
 int REDirect::rd_sphere(float radius, float zmin, float zmax, float thetamax)
 {
-  for(int phi = 0; phi < NUM_DIVISIONS; phi++)
+  for(int phi = 0; phi < NUM_DIVISIONS / 2; phi++)
   {
     // Find phi in radians
     // (Note: the -0.5 is to change the range of phi from -90 to 90 rather than 0 to 180)
-    double phiRadians = (((phi / (double)NUM_DIVISIONS) - 0.5) * 180) * (PI / 180.0);
+    double phiRadians = (((phi / (NUM_DIVISIONS / 2.0)) - 0.5) * 180) * (PI / 180.0);
     double radiusPrime = radius * cos(phiRadians);
 
     // Find next phi in radians
-    double phiPlusOneRadians = ((((phi + 1) / (double)NUM_DIVISIONS) - 0.5) * 180) * (PI / 180.0);
+    double phiPlusOneRadians = ((((phi + 1) / (NUM_DIVISIONS / 2.0)) - 0.5) * 180) * (PI / 180.0);
     double radiusPrimePlusOne = radius * cos(phiPlusOneRadians);
 
     for(int theta = 0; theta < NUM_DIVISIONS; theta++)
@@ -406,14 +449,14 @@ int REDirect::rd_circle(const float center[3], float radius)
 
   for(int x = 0; x <= y; x++)
   {
-    rd_write_pixel( x + center[0],  y + center[1], rd_direct_color.getRGB());
-    rd_write_pixel( y + center[0],  x + center[1], rd_direct_color.getRGB());
-    rd_write_pixel(-x + center[0],  y + center[1], rd_direct_color.getRGB());
-    rd_write_pixel(-y + center[0],  x + center[1], rd_direct_color.getRGB());
-    rd_write_pixel( x + center[0], -y + center[1], rd_direct_color.getRGB());
-    rd_write_pixel( y + center[0], -x + center[1], rd_direct_color.getRGB());
-    rd_write_pixel(-x + center[0], -y + center[1], rd_direct_color.getRGB());
-    rd_write_pixel(-y + center[0], -x + center[1], rd_direct_color.getRGB());
+    display_pixel( x + center[0],  y + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel( y + center[0],  x + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel(-x + center[0],  y + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel(-y + center[0],  x + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel( x + center[0], -y + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel( y + center[0], -x + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel(-x + center[0], -y + center[1], center[2], rd_direct_color.getRGB());
+    display_pixel(-y + center[0], -x + center[1], center[2], rd_direct_color.getRGB());
     if(p > 0)
     {
       p += 2*x - 2*y + 5;
@@ -615,7 +658,7 @@ void point_pipeline(const pointh& p)
     newP.z /= newP.w;
     newP.w /= newP.w;
 
-    rd_write_pixel(newP.x, newP.y, rd_direct_color.getRGB());
+    display_pixel(newP.x, newP.y, newP.z, rd_direct_color.getRGB());
   }//end if
 }//end point_pipeline
 
@@ -623,132 +666,161 @@ void line_pipeline(const pointh& p, bool draw_flag)
 {
   if(!draw_flag)
   {
-    // Store beginning endpoint in device coordinates
+    // Store beginning endpoint in clip coordinates
     current_line_pointh = rd_xform::multiply(current_xform, p);
     current_line_pointh = rd_xform::multiply(world_to_clip_xform, current_line_pointh);
-    current_line_pointh = rd_xform::multiply(clip_to_device_xform, current_line_pointh);
+    //current_line_pointh = rd_xform::multiply(clip_to_device_xform, current_line_pointh);
   }//end if
   else
   {
-    // Draw to next endpoint
-    float endpoint1[3];
-    float endpoint2[3];
+    pointh next_line_pointh;
 
-    pointh next_line_pointh(p.x, p.y, p.z, p.w);
-
-    // Transform next endpoint to device coordinates
+    // Transform next endpoint to clip coordinates
     next_line_pointh = rd_xform::multiply(current_xform, p);
     next_line_pointh = rd_xform::multiply(world_to_clip_xform, next_line_pointh);
-    next_line_pointh = rd_xform::multiply(clip_to_device_xform, next_line_pointh);
+    //next_line_pointh = rd_xform::multiply(clip_to_device_xform, next_line_pointh);
 
-    // Create a 3-element array from each endpoint
-    // (Note: 3-element array used in line drawing algorithm)
-    endpoint1[0] = current_line_pointh.x / current_line_pointh.w;
-    endpoint1[1] = current_line_pointh.y / current_line_pointh.w;
-    endpoint1[2] = current_line_pointh.z / current_line_pointh.w;
+    line_clip(next_line_pointh);
+  }//end else
+}//end line_pipeline
 
-    endpoint2[0] = next_line_pointh.x / next_line_pointh.w;
-    endpoint2[1] = next_line_pointh.y / next_line_pointh.w;
-    endpoint2[2] = next_line_pointh.z / next_line_pointh.w;
+void line_clip(const pointh& p)
+{
+  pointh next_line_pointh(p.x, p.y, p.z, p.w);
 
-    // Store "next" pointh as current for next DRAW flag
+  double BC1[6] = { current_line_pointh.x,
+		    current_line_pointh.w - current_line_pointh.x, 
+		    current_line_pointh.y,
+		    current_line_pointh.w - current_line_pointh.y,
+		    current_line_pointh.z,
+		    current_line_pointh.w - current_line_pointh.z };
+
+  double BC2[6] = { next_line_pointh.x,
+		    next_line_pointh.w - next_line_pointh.x,
+		    next_line_pointh.y,
+		    next_line_pointh.w - next_line_pointh.y,
+		    next_line_pointh.z,
+		    next_line_pointh.w - next_line_pointh.z };
+
+  int kode1 = 0;
+  int kode2 = 0;
+  int mask = 1;
+
+  for(int i = 5; i >= 0; i--)
+  {
+    if(BC1[i] < 0.0)
+    {
+      kode1 = kode1 | mask;
+    }//end if
+    if(BC2[i] < 0.0)
+    {
+      kode2 = kode2 | mask;
+    }//end if
+
+    mask = mask << 1;
+  }//end for
+
+  mask = 1;
+  int kode = kode1 | kode2;
+
+  int trivRej = kode1 & kode2;
+  int trivAcc = kode1 | kode2;
+
+  double alphaMin = 0;
+  double alphaMax = 1;
+
+  // For each boundary
+  for(int i = 0; i < 6 && !trivAcc && !trivRej; i++)
+  {
+    // If the line does not cross
+    // this boundary, go to the next
+    if(kode & mask)
+    {
+      double alpha = BC1[i] / (BC1[i] - BC2[i]);
+      if(kode1 & mask)
+      {
+	alphaMin = max(alphaMin, alpha);
+      }//end if
+      else
+      {
+	alphaMax = min(alphaMax, alpha);
+      }//end else
+      mask <<= 1;
+    }//end if
+  }//end for
+
+  if(trivRej)
+  {
+    current_line_pointh = next_line_pointh;
+  }//end if
+
+  if(alphaMin < alphaMax && !trivRej)
+  {
+    pointh newP0(current_line_pointh.x + alphaMin * (next_line_pointh.x - current_line_pointh.x),
+		 current_line_pointh.y + alphaMin * (next_line_pointh.y - current_line_pointh.y),
+		 current_line_pointh.z + alphaMin * (next_line_pointh.z - current_line_pointh.z),
+		 current_line_pointh.w + alphaMin * (next_line_pointh.w - current_line_pointh.w));
+
+    pointh newP1(current_line_pointh.x + alphaMax * (next_line_pointh.x - current_line_pointh.x),
+		 current_line_pointh.y + alphaMax * (next_line_pointh.y - current_line_pointh.y),
+		 current_line_pointh.z + alphaMax * (next_line_pointh.z - current_line_pointh.z),
+		 current_line_pointh.w + alphaMax * (next_line_pointh.w - current_line_pointh.w));
+
     current_line_pointh = next_line_pointh;
 
-    // Line-drawing algorithm goes from lower X to higher X
-    // so swap the two points if necessary
-    if(endpoint1[0] > endpoint2[0])
-    {
-      for(int i = 0; i < 3; i++)
-      {
-	float temp = endpoint1[i];
-	endpoint1[i] = endpoint2[i];
-	endpoint2[i] = temp;
-      }//end for
-    }//end if
+    newP0 = rd_xform::multiply(clip_to_device_xform, newP0);
+    newP1 = rd_xform::multiply(clip_to_device_xform, newP1);
+
+    double endpoint1[] = {newP0.x / newP0.w, newP0.y / newP0.w, newP0.z / newP0.w};
+    double endpoint2[] = {newP1.x / newP1.w, newP1.y / newP1.w, newP1.z / newP1.w};
 
     // Begin drawing the line
     double deltaX = endpoint2[0] - endpoint1[0];
     double deltaY = endpoint2[1] - endpoint1[1];
-    double slope = deltaY / deltaX;
+    double deltaZ = endpoint2[2] - endpoint1[2];
 
-    // Between 0 and 45 degrees
-    if(slope >= 0 && slope <= 1)
+    int numsteps;
+
+    // Determine whether to step in X, Y, or Z
+    // X
+    if(abs(deltaX) >= abs(deltaY) && abs(deltaX) >= abs(deltaZ))
     {
-      int y = endpoint1[1];
-      int p = 2 * deltaY - deltaX;
-
-      for(int x = endpoint1[0]; x <= endpoint2[0]; x++)
-      {
-        rd_write_pixel(x, y, rd_direct_color.getRGB());
-        if(p > 0)
-        {
-	  y++;
-	  p += 2*deltaY - 2*deltaX;
-        }//end if
-        else
-        {
-	  p += 2*deltaY;
-        }//end else
-      }//end for
+      numsteps = abs((int)endpoint2[0] - (int)endpoint1[0]);
     }//end if
-    // Greater than 45 degrees
-    else if(slope > 1)
+    // Y
+    else if(abs(deltaY) > abs(deltaX) && abs(deltaY) > abs(deltaZ))
     {
-      int x = endpoint1[0];
-      int p = 2 * deltaX - deltaY;
-
-      for(int y = endpoint1[1]; y <= endpoint2[1]; y++)
-      {
-        rd_write_pixel(x, y, rd_direct_color.getRGB());
-        if(p > 0)
-        {
-	  x++;
-	  p += 2*deltaX - 2*deltaY;
-        }//end if
-        else
-        {
-	  p += 2*deltaX;
-        }//end else
-      }//end for
+      numsteps = abs((int)endpoint2[1] - (int)endpoint1[1]);
     }//end else if
-    // Between 0 and -45 degrees
-    else if(slope < 0 && slope >= -1)
-    {
-      int y = endpoint1[1];
-      int p = -2 * deltaY - deltaX;
-
-      for(int x = endpoint1[0]; x <= endpoint2[0]; x++)
-      {
-        rd_write_pixel(x, y, rd_direct_color.getRGB());
-        if(p > 0)
-        {
-	  y--;
-	  p += -2*deltaY - 2*deltaX;
-        }//end if
-        else
-        {
-	  p += -2*deltaY;
-        }//end else
-      }//end for
-    }//end else if
+    // Z
     else
     {
-      int x = endpoint1[0];
-      int p = 2 * deltaX - -1*deltaY;
+      numsteps = abs((int)endpoint2[2] - (int)endpoint1[2]);
+    }//end else
 
-      for(int y = endpoint1[1]; y >= endpoint2[1]; y--)
-      {
-        rd_write_pixel(x, y, rd_direct_color.getRGB());
-        if( p > 0)
-        {
-	  x++;
-	  p += 2*deltaX - -2*deltaY;
-        }//end if
-        else
-        {
-	  p += 2*deltaX;
-        }//end else
-      }//end for
-    }//end else    
-  }//end else
-}//end line_pipeline
+    double x = endpoint1[0];
+    double y = endpoint1[1];
+    double z = endpoint1[2];
+
+    for(int i = 0; i < numsteps; i++)
+    {
+      display_pixel(x, y, z, rd_direct_color.getRGB());
+      x += deltaX / numsteps;
+      y += deltaY / numsteps;
+      z += deltaZ / numsteps;
+    }//end for
+  }//end if
+}//end line_clip
+
+void display_pixel(int x, int y, double z, float color[3])
+{
+  if(x >= 0 && x < display_xSize &&
+     y >= 0 && y < display_ySize)
+  {
+    if(z < zBuffer[x][y])
+    {
+      rd_write_pixel(x, y, color);
+      zBuffer[x][y] = z;
+    }//end if
+  }//end if
+}//end display_pixel
