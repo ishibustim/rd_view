@@ -26,8 +26,8 @@ librdview.a: screen_display.o rd_display.o rd_error.o rd_parse.o rd_main.o \
 # rd_view: librdview.a   obj_filenames_here 
 #	$(CC) $(CCFLAGS) -o rd_view obj_filenames_here librdview.a $(LIBS)
 
-rd_view: librdview.a rd_direct.o pnm_display.o color.o point.o pointh.o vector.o rd_xform.o
-	$(CC) $(CCFLAGS) -o rd_view rd_direct.o pnm_display.o color.o point.o pointh.o vector.o rd_xform.o librdview.a  $(LIBS)
+rd_view: librdview.a rd_direct.o pnm_display.o color.o edge.o point.o pointh.o vector.o rd_xform.o
+	$(CC) $(CCFLAGS) -o rd_view rd_direct.o pnm_display.o color.o edge.o point.o pointh.o vector.o rd_xform.o librdview.a  $(LIBS)
 
 clean:
 	-rm *.o *.a rd_view

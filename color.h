@@ -13,6 +13,6 @@ struct color
   float* getRGB();
 
   friend bool operator==(const color& c1, const color& c2);
-};//end class
+};//end struct
 
 #endif
