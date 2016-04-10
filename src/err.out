@@ -1,5 +1,0 @@
-edge.cc: In constructor ‘edge::edge()’:
-edge.cc:14:10: error: ‘NULL’ was not declared in this scope
-   next = NULL;
-          ^
-make: *** [edge.o] Error 1
